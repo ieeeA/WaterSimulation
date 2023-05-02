@@ -1,0 +1,160 @@
+// Each #kernel tells which function to compile; you can have many kernels
+#pragma kernel CSMain
+#pragma kernel CSInitBuffer
+
+cbuffer _SimulationConstantBuffer
+{
+    int subdivisionsX;
+    int subdivisionsZ;
+    float sourceWaterAmount;
+    float sourceWaterRadius;
+    float waterDensity;
+    float gravityConstant;
+    float gridSize;
+    float sandDissolveCoefficient;
+    float soilDissolveCoefficient;
+    float stoneDissolveCoefficient;
+
+    float deltaTime;
+    float deltaTimeScale;
+
+    float3 sourceWaterSource;
+};
+
+// SimulationBuffer
+struct GridElement
+{
+    float waterAmount;
+    float dissolvedSandAmount;
+    float dissolvedSoilAmount;
+    float dissolvedStoneAmount;
+    float sandAmount;
+    float soilAmount;
+    float stoneAmount;
+    float _padding;
+    float4 waterVelocity;
+};
+
+RWStructuredBuffer<GridElement> simulationBufferIn;
+RWStructuredBuffer<GridElement> simulationBufferOut;
+
+RWTexture2D<float> waterHeightMapTexture;
+RWTexture2D<float> groundHeightMapTexture;
+RWTexture2D<float> groundSplatMapTexture;
+
+[numthreads(8, 8, 1)]
+void CSInitBuffer(uint2 id : SV_DispatchThreadID)
+{
+    int idx = id.x + id.y * subdivisionsX;
+    int idl = id.x - 1 + id.y * subdivisionsX;
+    int idr = id.x + 1 + id.y * subdivisionsX;
+    int idt = id.x + (id.y - 1) * subdivisionsX;
+    int idb = id.x + (id.y + 1) * subdivisionsX;
+
+    GridElement t;
+    t.waterAmount = 0.0f;
+    t.dissolvedSandAmount = 0.0f;
+    t.dissolvedSoilAmount = 0.0f;
+    t.dissolvedStoneAmount = 0.0f;
+    t.sandAmount = 0.0f;
+    t.soilAmount = 0.0f;
+    t.stoneAmount = 0.0f;
+    t._padding = 0.0f;
+    t.waterVelocity = float4(0, 0, 0, 0);
+
+    float3 v = float3((float)id.x / (float)subdivisionsX, 0, (float)id.y / (float)subdivisionsZ);
+    float3 p = float3(0.5f, 0, 0.5f);
+    if (length(v - p) > 0.4f)
+    {
+        t.stoneAmount = 50.0f;
+    }
+    else
+    {
+        t.stoneAmount = 0;
+    }
+    if (length(v - p) < 0.3f)
+    {
+        t.waterAmount = 20.0f;
+    }
+    else
+    {
+        t.waterAmount = 0;
+    }
+
+    simulationBufferIn[idx] = t;
+    simulationBufferOut[idx] = t;
+}
+
+[numthreads(8,8,1)]
+void CSMain(uint2 id : SV_DispatchThreadID)
+{
+    int idx = id.x + id.y * subdivisionsX;
+    int idt = id.x + (id.y - 1) * subdivisionsX;
+    int idr = id.x + 1 + id.y * subdivisionsX;
+    int idb = id.x + (id.y + 1) * subdivisionsX;
+    int idl = id.x - 1 + id.y * subdivisionsX;
+
+    GridElement output;
+
+    GridElement t = simulationBufferIn[idx];
+    GridElement tt = simulationBufferIn[idt];
+    GridElement tr = simulationBufferIn[idr];
+    GridElement tb = simulationBufferIn[idb];
+    GridElement tl = simulationBufferIn[idl];
+
+    float h = t.waterAmount + t.sandAmount + t.soilAmount + t.stoneAmount;
+    float4 neighborH =
+        float4(tt.waterAmount, tr.waterAmount, tb.waterAmount, tl.waterAmount) +
+        float4(tt.sandAmount, tr.sandAmount, tb.sandAmount, tl.sandAmount) +
+        float4(tt.soilAmount, tr.soilAmount, tb.soilAmount, tl.soilAmount) +
+        float4(tt.stoneAmount, tr.stoneAmount, tb.stoneAmount, tl.stoneAmount);
+    float4 pressure = (float4(h, h, h, h) - neighborH) * gravityConstant * waterDensity;
+    
+    if (pressure.x < 0) pressure.x = 0;
+    if (pressure.y < 0) pressure.y = 0;
+    if (pressure.z < 0) pressure.z = 0;
+    if (pressure.w < 0) pressure.w = 0;
+
+    float4 acc = pressure / (waterDensity * gridSize);
+    
+    float deltaT = deltaTime * deltaTimeScale;
+    float divergent = deltaT * (t.waterVelocity.x + t.waterVelocity.y + t.waterVelocity.z + t.waterVelocity.w);
+
+    // waterAmount time evolution (importAmount - exportAmount)
+    output.waterAmount = t.waterAmount +
+        ((tb.waterVelocity.x - t.waterVelocity.x) +
+        (tl.waterVelocity.y - t.waterVelocity.y) +
+        (tt.waterVelocity.z - t.waterVelocity.z) +
+        (tr.waterVelocity.w - t.waterVelocity.w)) * (deltaT / (gridSize * gridSize));
+    output.waterAmount = output.waterAmount < 0.0f ? 0.0f : output.waterAmount;
+
+    // waterVelocity time evolution
+    float4 nextVelocity = t.waterVelocity + acc * deltaT * gridSize * gridSize;
+    if ((t.waterAmount * gridSize * gridSize) < 0.01f)
+    {
+        output.waterVelocity = float4(0, 0, 0, 0);
+    }
+    else if (divergent >= (gridSize * gridSize * t.waterAmount))
+    {
+        //output.waterVelocity = float4(0, 0, 0, 0);
+        float4 uniV = normalize(nextVelocity);
+        output.waterVelocity = uniV * (t.waterAmount / divergent);
+    }
+    else 
+    {
+        output.waterVelocity = nextVelocity * 0.99999f;
+    }
+
+    output.dissolvedSandAmount = 0.0f;
+    output.dissolvedSoilAmount = 0.0f;
+    output.dissolvedStoneAmount = 0.0f;
+    output.sandAmount = 0.0f;
+    output.soilAmount = 0.0f;
+    output.stoneAmount = t.stoneAmount;
+    output._padding = 0.0f;
+
+    simulationBufferOut[idx] = output;
+
+    waterHeightMapTexture[id.xy] = output.waterAmount;
+    groundHeightMapTexture[id.xy] = output.stoneAmount;
+}
